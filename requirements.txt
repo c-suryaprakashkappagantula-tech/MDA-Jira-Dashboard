@@ -1,0 +1,6 @@
+pandas
+streamlit
+python-pptx
+lxml
+openpyxl
+playwright

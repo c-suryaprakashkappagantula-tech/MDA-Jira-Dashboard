@@ -1,0 +1,28 @@
+# Environment
+.env
+.venv/
+__pycache__/
+
+# Artifacts & outputs
+artifacts/
+output/
+outputs/
+downloads/
+*.zip
+
+# IDE
+.vscode/
+.idea/
+.kiro/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temp files
+*.pyc
+*.pyo
+_smoke*.py
+_check*.py
+_compare*.py
+_inspect*.py
