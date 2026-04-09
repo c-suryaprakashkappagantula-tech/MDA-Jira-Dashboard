@@ -1582,22 +1582,20 @@ def _color_code_features_table(tbl, df):
 
 def add_table_parts_colored(prs, policy, df, title, logo_path):
     """Add table slides with conditional color coding for Features in Scope."""
-    # First add the table normally
     slides_before = len(prs.slides)
     added = add_table_parts(prs, policy, df, title, logo_path)
-    # Now color-code each table slide that was just added
+    # Color-code each table slide, tracking actual row offset
+    row_offset = 0
     for si in range(slides_before, len(prs.slides)):
         slide = prs.slides[si]
         for shape in slide.shapes:
             if shape.shape_type == 19:  # table
                 tbl = shape.table
-                # Figure out which chunk of df this table represents
                 data_rows = len(tbl.rows) - 1  # minus header
-                start_row = (si - slides_before) * policy.rows_per_part
-                # Get the corresponding df slice
-                chunk = df.iloc[start_row:start_row + data_rows].reset_index(drop=True) if start_row < len(df) else pd.DataFrame()
+                chunk = df.iloc[row_offset:row_offset + data_rows].reset_index(drop=True) if row_offset < len(df) else pd.DataFrame()
                 if not chunk.empty:
                     _color_code_features_table(tbl, chunk)
+                row_offset += data_rows
     return added
 
 
@@ -1638,6 +1636,118 @@ def add_cycle_report_slides(prs, policy, cycle_results, logo_path):
     _add_pie(prog_img, Inches(0.50), 'Progression')
     _add_pie(reg_img, Inches(0.50) + half_w + Inches(0.40), 'Regression')
     add_brand_footer_logo(s, prs, logo_path)
+
+    # Bar Charts slide — built from execution data using python-pptx charts
+    exec_df = cycle_results.get('exec_df')
+    if exec_df is not None and not exec_df.empty:
+        from pptx.chart.data import CategoryChartData
+        from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+
+        s2 = prs.slides.add_slide(blank)
+        tb2 = s2.shapes.add_textbox(SIDE, Inches(0.25), usable_w, Inches(0.30))
+        tf2 = tb2.text_frame; tf2.clear(); tf2.word_wrap = False
+        tf2.text = 'Progression & Regression Execution Status'
+        p2 = tf2.paragraphs[0]; p2.font.name = FONT_NAME; p2.font.size = Pt(13); p2.font.bold = True; p2.font.color.rgb = NAVY
+
+        STATUS_COLORS = {
+            'PASS': RGBColor(76, 175, 80),
+            'NOT EXECUTED': RGBColor(158, 158, 158),
+            'NOT APPLICABLE': RGBColor(233, 150, 206),
+            'DEFERRED': RGBColor(66, 165, 245),
+            'FAIL': RGBColor(229, 57, 53),
+            'BLOCKED': RGBColor(109, 40, 40),
+            'IN PROGRESS': RGBColor(129, 199, 245),
+            'WORK IN PROGRESS': RGBColor(129, 199, 245),
+            'CONDITIONAL PASS': RGBColor(165, 214, 167),
+        }
+
+        status_cols = [c for c in exec_df.columns if c.upper() in STATUS_COLORS or c in STATUS_COLORS]
+        if not status_cols:
+            status_cols = [c for c in exec_df.columns if c not in ('Release', 'Execution Assignee', 'TOTAL')]
+
+        # Get TOTAL row
+        total_mask = exec_df.apply(lambda r: any(str(v).strip().upper() == 'TOTAL' for v in r), axis=1)
+        total_row = exec_df[total_mask].iloc[0] if total_mask.any() else exec_df[status_cols].sum()
+
+        # Build categories and values (sorted by value desc)
+        cat_val_color = []
+        for col in status_cols:
+            try:
+                val = int(total_row[col]) if col in total_row.index else 0
+            except Exception:
+                val = 0
+            if val > 0:
+                cat_val_color.append((col.title(), val, STATUS_COLORS.get(col, STATUS_COLORS.get(col.upper(), RGBColor(100, 100, 100)))))
+
+        cat_val_color.sort(key=lambda x: x[1], reverse=True)
+
+        if cat_val_color:
+            categories = [d[0] for d in cat_val_color]
+            values = [d[1] for d in cat_val_color]
+            colors = [d[2] for d in cat_val_color]
+
+            # Single series, multiple categories = one bar per status
+            chart_data = CategoryChartData()
+            chart_data.categories = categories
+            chart_data.add_series('Count', values)
+
+            chart_left = Inches(0.50)
+            chart_top = Inches(0.65)
+            chart_w = int(prs.slide_width / 2) - Inches(0.40)
+            chart_h = prs.slide_height - Inches(1.50)
+
+            chart_shape = s2.shapes.add_chart(
+                XL_CHART_TYPE.BAR_CLUSTERED, chart_left, chart_top, chart_w, chart_h, chart_data
+            )
+            chart = chart_shape.chart
+            chart.has_legend = False
+            chart.has_title = True
+            chart.chart_title.text_frame.text = 'Progression Status'
+            chart.chart_title.text_frame.paragraphs[0].font.size = Pt(12)
+            chart.chart_title.text_frame.paragraphs[0].font.bold = True
+
+            # Style: clean, no gridlines, smooth look
+            plot = chart.plots[0]
+            plot.gap_width = 80  # thicker bars (lower = thicker)
+
+            # Remove gridlines
+            value_axis = chart.value_axis
+            value_axis.has_major_gridlines = False
+            value_axis.has_minor_gridlines = False
+            value_axis.visible = False  # hide value axis
+
+            # Style category axis (status labels)
+            cat_axis = chart.category_axis
+            cat_axis.has_major_gridlines = False
+            cat_axis.tick_labels.font.size = Pt(9)
+            cat_axis.tick_labels.font.bold = True
+            cat_axis.format.line.fill.background()  # no axis line
+
+            # Color each bar individually
+            series = plot.series[0]
+            series.format.line.fill.background()  # no bar outline
+            for i, color in enumerate(colors):
+                pt = series.points[i]
+                pt.format.fill.solid()
+                pt.format.fill.fore_color.rgb = color
+                pt.format.line.fill.background()  # no outline per point
+
+            # Data labels at end of bars
+            series.has_data_labels = True
+            series.data_labels.show_value = True
+            series.data_labels.show_category_name = False
+            series.data_labels.font.size = Pt(9)
+            series.data_labels.font.bold = True
+
+            # Right side: note about regression
+            note_left = int(prs.slide_width / 2) + Inches(0.20)
+            note_tb = s2.shapes.add_textbox(note_left, Inches(3.0), int(prs.slide_width / 2) - Inches(0.70), Inches(0.50))
+            note_tf = note_tb.text_frame; note_tf.clear()
+            note_tf.text = 'Regression breakdown available in Pie Chart slide'
+            note_p = note_tf.paragraphs[0]; note_p.font.size = Pt(9); note_p.font.color.rgb = RGBColor(128, 128, 128)
+            note_p.alignment = PP_ALIGN.CENTER
+
+        add_brand_footer_logo(s2, prs, logo_path)
 
     # Features in Scope table (editable, with auto-split)
     if cycle_results.get('features_df') is not None and not cycle_results['features_df'].empty:
@@ -2625,6 +2735,9 @@ if run_btn:
                     # V3.0: Add cycle report slides before Thank You
                     cycle_data = results.get('cycle_reports')
                     if cycle_data:
+                        # Pass execution data for bar chart generation
+                        if not qtr_df.empty:
+                            cycle_data['exec_df'] = qtr_df
                         try:
                             add_cycle_report_slides(prs, policy, cycle_data, logo)
                             print('[OK] Cycle report slides added')
