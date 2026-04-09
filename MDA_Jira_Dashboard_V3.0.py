@@ -1000,15 +1000,23 @@ def _qtr_post_process_csv_to_excel(csv_path, iteration_str):
     exec_candidates = ['Execution Assignee', 'Assignee', 'Execution_Assignee', 'execution assignee', 'execution_assignee']
     col_map = {c.lower(): c for c in df.columns}
     exec_col = next((col_map[c.lower()] for c in exec_candidates if c.lower() in col_map), None)
+    is_regression = '_REG' in iteration_str.upper()
     if exec_col is None:
         _qtr_info(f"[WARN] 'Execution Assignee' column not found. Columns: {list(df.columns)}. Skipping filter.")
         df_f = df.copy()
+    elif is_regression:
+        # Don't filter regression by assignees — keep all rows
+        df_f = df.copy()
+        _qtr_info(f'[{_qtr_tnow()} ms] Regression mode: keeping all {len(df_f)} rows (no assignee filter)')
     else:
         ser = df[exec_col].astype(str).str.strip()
         df_f = df[ser.isin(ALLOWED_REPORTERS)].copy()
         _qtr_info(f'[{_qtr_tnow()} ms] Filtered by allowed assignees: kept {len(df_f)} of {len(df)} rows')
     present_status = [c for c in _QTR_STATUS_CANDIDATES if c in df_f.columns]
-    df_f.insert(0, 'Release', f'INTEGRATION_PROGRESSION_{iteration_str}')
+    # Set correct Release name based on iteration
+    base_iter = iteration_str.replace('_REG', '')
+    release_name = f'INTEGRATION_REGRESSION_{base_iter}' if is_regression else f'INTEGRATION_PROGRESSION_{base_iter}'
+    df_f.insert(0, 'Release', release_name)
     ordered_cols = ['Release'] + ([exec_col] if exec_col else []) + present_status
     try: df_f = df_f[ordered_cols]
     except Exception: pass
@@ -1019,7 +1027,7 @@ def _qtr_post_process_csv_to_excel(csv_path, iteration_str):
     if present_status:
         totals_dict = {c: int(df_f[c].sum()) for c in present_status}
         totals_dict['TOTAL'] = int(df_f['TOTAL'].sum()) if 'TOTAL' in df_f.columns else sum(totals_dict.values())
-        totals_dict['Release'] = f'INTEGRATION_PROGRESSION_{iteration_str}'
+        totals_dict['Release'] = release_name
         if exec_col: totals_dict[exec_col] = 'TOTAL'
         total_row = {col: totals_dict.get(col, '') for col in df_f.columns}
         df_out = pd.concat([df_f, pd.DataFrame([total_row])], ignore_index=True)
@@ -1169,23 +1177,33 @@ def run_qmetry_test_report(iteration, keep_browser=False):
         _qtr_select_software_project(page)
         _qtr_search_integration_folder(page, iteration)
         _qtr_go_to_test_cycle(page)
-        key_value = _qtr_fetch_key_for_summary(page, iteration)
-        _qtr_go_to_test_report(page)
-        _qtr_filter_by_key_and_generate(page, key_value)
 
-        # ── Step A: By Execution Assignee export ──
+        # Find BOTH Progression and Regression keys
+        prog_key, reg_key = _qtr_fetch_both_keys(page, iteration)
+        if not prog_key:
+            # Fallback to old method for progression
+            prog_key = _qtr_fetch_key_for_summary(page, iteration)
+        _qtr_info(f'[{_qtr_tnow()} ms] Keys: prog={prog_key}, reg={reg_key}')
+
+        # ════════════════════════════════════════════════════════
+        # PROGRESSION: By Assignee + By Label
+        # ════════════════════════════════════════════════════════
+        _qtr_go_to_test_report(page)
+        _qtr_filter_by_key_and_generate(page, prog_key)
+
+        # ── Progression: By Execution Assignee export ──
         excel_path = None
         try:
             csv_path = _qtr_export_csv_tabular(page, context)
             excel_path = _qtr_post_process_csv_to_excel(csv_path, iteration)
-            _qtr_info(f'[{_qtr_tnow()} ms] === By Assignee completed === Excel: {excel_path}')
+            _qtr_info(f'[{_qtr_tnow()} ms] === Progression By Assignee completed === {excel_path}')
         except Exception as assignee_err:
-            _qtr_info(f'[WARN] By Assignee export failed: {assignee_err}')
+            _qtr_info(f'[WARN] Progression By Assignee failed: {assignee_err}')
 
-        # ── Step B: By Label export ──
+        # ── Progression: By Label export ──
         label_excel_path = None
         try:
-            _qtr_info(f'[{_qtr_tnow()} ms] === Step: Switching to By Label ===')
+            _qtr_info(f'[{_qtr_tnow()} ms] === Switching to By Label (Progression) ===')
             for xp in [
                 "//*[@id='root_4.14.1.1']//span[normalize-space()='Test Execution Reports']",
                 "//*[@id='root_4.14.1.1']//*[normalize-space()='Test Case Execution Summary']",
@@ -1201,22 +1219,74 @@ def run_qmetry_test_report(iteration, keep_browser=False):
             loc.click()
             _qtr_info(f'[{_qtr_tnow()} ms] === Clicked By Label ===')
             page.wait_for_timeout(1500)
-            _qtr_filter_by_key_and_generate(page, key_value)
+            _qtr_filter_by_key_and_generate(page, prog_key)
             label_csv_path = _qtr_export_csv_tabular(page, context)
             label_excel_path = _qtr_post_process_label_csv(label_csv_path, iteration)
-            _qtr_info(f'[{_qtr_tnow()} ms] === By Label completed === Excel: {label_excel_path}')
+            _qtr_info(f'[{_qtr_tnow()} ms] === Progression By Label completed === {label_excel_path}')
         except Exception as lbl_err:
-            _qtr_info(f'[WARN] By Label failed: {lbl_err}')
+            _qtr_info(f'[WARN] Progression By Label failed: {lbl_err}')
             traceback.print_exc()
 
+        # ════════════════════════════════════════════════════════
+        # REGRESSION: By Assignee + By Label (same flow, different key)
+        # ════════════════════════════════════════════════════════
+        reg_excel_path = None
+        reg_label_excel_path = None
+        if reg_key:
+            # ── Regression: By Execution Assignee ──
+            try:
+                _qtr_info(f'[{_qtr_tnow()} ms] === Switching to Regression By Assignee ===')
+                # Click By Execution Assignee
+                for xp in [
+                    "//*[@id='root_4.14.1.1']//span[normalize-space()='Test Execution Reports']",
+                    "//*[@id='root_4.14.1.1']//*[normalize-space()='Test Case Execution Summary']",
+                    "//*[@id='root_4.14.1.1']//*[normalize-space()='By Execution Assignee']",
+                ]:
+                    try: _qtr_click_xpath(page, xp, 'Nav', 300)
+                    except Exception: continue
+                page.wait_for_timeout(1000)
+                _qtr_filter_by_key_and_generate(page, reg_key)
+                reg_csv_path = _qtr_export_csv_tabular(page, context)
+                reg_excel_path = _qtr_post_process_csv_to_excel(reg_csv_path, f'{iteration}_REG')
+                _qtr_info(f'[{_qtr_tnow()} ms] === Regression By Assignee completed === {reg_excel_path}')
+            except Exception as reg_err:
+                _qtr_info(f'[WARN] Regression By Assignee failed: {reg_err}')
+
+            # ── Regression: By Label ──
+            try:
+                _qtr_info(f'[{_qtr_tnow()} ms] === Switching to By Label (Regression) ===')
+                for xp in [
+                    "//*[@id='root_4.14.1.1']//span[normalize-space()='Test Execution Reports']",
+                    "//*[@id='root_4.14.1.1']//*[normalize-space()='Test Case Execution Summary']",
+                ]:
+                    try: _qtr_click_xpath(page, xp, 'Expand tree', 300)
+                    except Exception: continue
+                page.wait_for_timeout(500)
+                loc = page.locator(f'xpath={_BY_LABEL_XPATH}').first
+                loc.wait_for(state='attached', timeout=10000)
+                try: loc.scroll_into_view_if_needed()
+                except Exception: pass
+                loc.click()
+                page.wait_for_timeout(1500)
+                _qtr_filter_by_key_and_generate(page, reg_key)
+                reg_label_csv = _qtr_export_csv_tabular(page, context)
+                reg_label_excel_path = _qtr_post_process_label_csv(reg_label_csv, f'{iteration}_REG')
+                _qtr_info(f'[{_qtr_tnow()} ms] === Regression By Label completed === {reg_label_excel_path}')
+            except Exception as reg_lbl_err:
+                _qtr_info(f'[WARN] Regression By Label failed: {reg_lbl_err}')
+        else:
+            _qtr_info(f'[WARN] No Regression key found — skipping Regression exports')
+
+        _qtr_info(f'[{_qtr_tnow()} ms] === All exports completed ===')
+
         if keep_browser:
-            return excel_path, label_excel_path, page, context, browser, pw
-        return excel_path, label_excel_path
+            return excel_path, label_excel_path, reg_excel_path, reg_label_excel_path, page, context, browser, pw
+        return excel_path, label_excel_path, reg_excel_path, reg_label_excel_path
     except Exception as e:
         _qtr_info(f'[ERROR] run_qmetry_test_report FAILED: {e}')
         traceback.print_exc()
         if keep_browser:
-            return None, None, page, context, browser, pw
+            return None, None, None, None, page, context, browser, pw
         raise
     finally:
         if not keep_browser:
@@ -1739,13 +1809,58 @@ def add_cycle_report_slides(prs, policy, cycle_results, logo_path):
             series.data_labels.font.size = Pt(9)
             series.data_labels.font.bold = True
 
-            # Right side: note about regression
-            note_left = int(prs.slide_width / 2) + Inches(0.20)
-            note_tb = s2.shapes.add_textbox(note_left, Inches(3.0), int(prs.slide_width / 2) - Inches(0.70), Inches(0.50))
-            note_tf = note_tb.text_frame; note_tf.clear()
-            note_tf.text = 'Regression breakdown available in Pie Chart slide'
-            note_p = note_tf.paragraphs[0]; note_p.font.size = Pt(9); note_p.font.color.rgb = RGBColor(128, 128, 128)
-            note_p.alignment = PP_ALIGN.CENTER
+            # Right side: Regression bar chart
+            reg_exec_df = cycle_results.get('reg_exec_df')
+            if reg_exec_df is not None and not reg_exec_df.empty:
+                reg_status_cols = [c for c in reg_exec_df.columns if c.upper() in STATUS_COLORS or c in STATUS_COLORS]
+                if not reg_status_cols:
+                    reg_status_cols = [c for c in reg_exec_df.columns if c not in ('Release', 'Execution Assignee', 'TOTAL')]
+                reg_total_mask = reg_exec_df.apply(lambda r: any(str(v).strip().upper() == 'TOTAL' for v in r), axis=1)
+                reg_total_row = reg_exec_df[reg_total_mask].iloc[0] if reg_total_mask.any() else reg_exec_df[reg_status_cols].sum()
+                reg_cvc = []
+                for col in reg_status_cols:
+                    try: val = int(reg_total_row[col]) if col in reg_total_row.index else 0
+                    except Exception: val = 0
+                    if val > 0:
+                        reg_cvc.append((col.title(), val, STATUS_COLORS.get(col, STATUS_COLORS.get(col.upper(), RGBColor(100, 100, 100)))))
+                reg_cvc.sort(key=lambda x: x[1], reverse=True)
+                if reg_cvc:
+                    reg_cats = [d[0] for d in reg_cvc]
+                    reg_vals = [d[1] for d in reg_cvc]
+                    reg_colors = [d[2] for d in reg_cvc]
+                    reg_chart_data = CategoryChartData()
+                    reg_chart_data.categories = reg_cats
+                    reg_chart_data.add_series('Count', reg_vals)
+                    reg_chart_left = int(prs.slide_width / 2) + Inches(0.20)
+                    reg_chart_shape = s2.shapes.add_chart(
+                        XL_CHART_TYPE.BAR_CLUSTERED, reg_chart_left, chart_top, chart_w, chart_h, reg_chart_data
+                    )
+                    reg_chart = reg_chart_shape.chart
+                    reg_chart.has_legend = False
+                    reg_chart.has_title = True
+                    reg_chart.chart_title.text_frame.text = 'Regression Status'
+                    reg_chart.chart_title.text_frame.paragraphs[0].font.size = Pt(12)
+                    reg_chart.chart_title.text_frame.paragraphs[0].font.bold = True
+                    reg_plot = reg_chart.plots[0]
+                    reg_plot.gap_width = 80
+                    reg_chart.value_axis.has_major_gridlines = False
+                    reg_chart.value_axis.visible = False
+                    reg_chart.category_axis.has_major_gridlines = False
+                    reg_chart.category_axis.tick_labels.font.size = Pt(9)
+                    reg_chart.category_axis.tick_labels.font.bold = True
+                    reg_chart.category_axis.format.line.fill.background()
+                    reg_series = reg_plot.series[0]
+                    reg_series.format.line.fill.background()
+                    for i, color in enumerate(reg_colors):
+                        pt = reg_series.points[i]
+                        pt.format.fill.solid()
+                        pt.format.fill.fore_color.rgb = color
+                        pt.format.line.fill.background()
+                    reg_series.has_data_labels = True
+                    reg_series.data_labels.show_value = True
+                    reg_series.data_labels.show_category_name = False
+                    reg_series.data_labels.font.size = Pt(9)
+                    reg_series.data_labels.font.bold = True
 
         add_brand_footer_logo(s2, prs, logo_path)
 
@@ -1862,7 +1977,7 @@ def _s2_clear_and_set_cell(tbl, row, col, text, bold=False, size=101600):
     run.font.name = 'Arial'; run.font.size = Pt(size // 12700)
     run.font.bold = bold; run.font.color.rgb = RGBColor(0, 0, 0)
 
-def _s2_populate_manual_table(slide, labels_df, iteration, exec_df=None):
+def _s2_populate_manual_table(slide, labels_df, iteration, exec_df=None, reg_exec_df=None):
     tbl_shape = _s2_shape_by_name(slide, 'Table 1')
     if tbl_shape is None: return
     tbl = tbl_shape.table
@@ -1914,18 +2029,40 @@ def _s2_populate_manual_table(slide, labels_df, iteration, exec_df=None):
             for hdr, aliases in col_aliases.items():
                 exec_totals[hdr] = _sum_col(exec_sub, aliases)
     row_defs = [
-        (f'Integration progression {cur_iter}', True),
-        (f'Integration Regression {cur_iter}', False),
-        (f'Prod defects {major}.X', False),
+        (f'Integration progression {cur_iter}', True, exec_totals),
+        (f'Integration Regression {cur_iter}', reg_exec_df is not None and not reg_exec_df.empty, None),
+        (f'Prod defects {major}.X', False, None),
     ]
-    for ri, (label, populate) in enumerate(row_defs, start=1):
+    # Compute regression totals if available
+    reg_exec_totals = {}
+    if reg_exec_df is not None and not reg_exec_df.empty:
+        assignee_col = None
+        for c in reg_exec_df.columns:
+            if c.strip().upper() in ('EXECUTION ASSIGNEE', 'ASSIGNEE'): assignee_col = c; break
+        total_row = None
+        if assignee_col:
+            mask = reg_exec_df[assignee_col].astype(str).str.strip().str.upper() == 'TOTAL'
+            if mask.any(): total_row = reg_exec_df[mask].iloc[0]
+        if total_row is not None:
+            for hdr, aliases in col_aliases.items():
+                col = _find_col(reg_exec_df, aliases)
+                if col:
+                    try: reg_exec_totals[hdr] = int(total_row[col])
+                    except Exception: reg_exec_totals[hdr] = 0
+                else: reg_exec_totals[hdr] = 0
+        else:
+            for hdr, aliases in col_aliases.items():
+                reg_exec_totals[hdr] = _sum_col(reg_exec_df, aliases)
+        row_defs[1] = (f'Integration Regression {cur_iter}', True, reg_exec_totals)
+
+    for ri, (label, populate, totals_data) in enumerate(row_defs, start=1):
         if ri >= len(tbl.rows): break
         _s2_clear_and_set_cell(tbl, ri, 0, label)
-        if populate and exec_totals:
+        if populate and totals_data:
             for hdr, aliases in col_aliases.items():
                 ci = header_map.get(hdr)
                 if ci is None: continue
-                val = exec_totals.get(hdr, 0)
+                val = totals_data.get(hdr, 0)
                 _s2_clear_and_set_cell(tbl, ri, ci, val if val else '-', bold=(hdr == 'Total'))
         else:
             for ci in range(1, len(tbl.columns)):
@@ -2031,7 +2168,7 @@ def _s2_update_date_textbox(slide):
     run.font.name = 'Arial'; run.font.size = Pt(9); run.font.bold = True
 
 def add_slide2_delivery_updates(dst_prs, iteration, labels_df=None, defects_df=None,
-                                exec_df=None, template_path=_S2_TEMPLATE_PATH, insert_index=1):
+                                exec_df=None, reg_exec_df=None, template_path=_S2_TEMPLATE_PATH, insert_index=1):
     if not template_path.exists():
         print(f'[WARN] Slide2 template not found: {template_path}'); return
     src_prs = Presentation(str(template_path))
@@ -2041,7 +2178,7 @@ def add_slide2_delivery_updates(dst_prs, iteration, labels_df=None, defects_df=N
     _s2_set_left_panel_text(new_slide, iteration)
     _s2_update_date_textbox(new_slide)
     if labels_df is not None or exec_df is not None:
-        _s2_populate_manual_table(new_slide, labels_df, iteration, exec_df=exec_df)
+        _s2_populate_manual_table(new_slide, labels_df, iteration, exec_df=exec_df, reg_exec_df=reg_exec_df)
     if defects_df is not None:
         _s2_populate_defect_table(new_slide, defects_df, iteration)
     print(f'[OK] Slide 2 (Delivery Updates) inserted at position {insert_index + 1}')
@@ -2617,19 +2754,29 @@ if run_btn:
                         try:
                             if m1 and m2:
                                 ret = run_qmetry_test_report(iteration, keep_browser=True)
-                                excel_path, label_excel_path, _qtr_page, _qtr_context, _qtr_browser, _qtr_pw = ret
+                                excel_path, label_excel_path, reg_excel_path, reg_label_excel_path, _qtr_page, _qtr_context, _qtr_browser, _qtr_pw = ret
                             else:
-                                excel_path, label_excel_path = run_qmetry_test_report(iteration, keep_browser=False)
+                                excel_path, label_excel_path, reg_excel_path, reg_label_excel_path = run_qmetry_test_report(iteration, keep_browser=False)
                             if excel_path:
                                 results['exec_excel'] = Path(str(excel_path))
-                                print('[OK] Generated Excel => %s' % results['exec_excel'])
+                                print('[OK] Progression Exec Excel => %s' % results['exec_excel'])
                             else:
                                 results['exec_excel'] = None
                             if label_excel_path:
                                 results['label_excel'] = Path(str(label_excel_path))
-                                print('[OK] Features in Scope => %s' % results['label_excel'])
+                                print('[OK] Progression Features => %s' % results['label_excel'])
                             else:
                                 results['label_excel'] = None
+                            if reg_excel_path:
+                                results['reg_exec_excel'] = Path(str(reg_excel_path))
+                                print('[OK] Regression Exec Excel => %s' % results['reg_exec_excel'])
+                            else:
+                                results['reg_exec_excel'] = None
+                            if reg_label_excel_path:
+                                results['reg_label_excel'] = Path(str(reg_label_excel_path))
+                                print('[OK] Regression Features => %s' % results['reg_label_excel'])
+                            else:
+                                results['reg_label_excel'] = None
                             break  # success
                         except Exception as e3:
                             print('[RETRY] Module 3 attempt %d/3 failed: %s' % (_m3_attempts, e3))
@@ -2705,14 +2852,22 @@ if run_btn:
                     labels_df = ensure_release_first(labels_df)
                     defects_df = ensure_release_first(defects_df)
                     qtr_df = ensure_release_first(qtr_df)
+
+                    # Load regression data if available
+                    reg_xp = results.get('reg_exec_excel')
+                    reg_qtr_df = pd.read_excel(reg_xp) if reg_xp and reg_xp.exists() else pd.DataFrame()
+                    if not reg_qtr_df.empty:
+                        reg_qtr_df = ensure_release_first(reg_qtr_df)
+
                     prs = Presentation()
                     prs.slide_width = Inches(10); prs.slide_height = Inches(7.5)
                     policy = LayoutPolicy(rows_per_part=10, top_in=1.05, side_in=0.90, footer_in=2.00, body_pt=8, header_pt=10)
                     logo = None
                     add_title_slide(prs, logo)
-                    # --- Slide 2: Delivery Updates from template ---
+                    # --- Slide 2: Delivery Updates from template (pass regression data too) ---
                     try:
-                        add_slide2_delivery_updates(prs, iteration, labels_df=labels_df, defects_df=defects_df, exec_df=qtr_df, insert_index=1)
+                        add_slide2_delivery_updates(prs, iteration, labels_df=labels_df, defects_df=defects_df,
+                                                    exec_df=qtr_df, reg_exec_df=reg_qtr_df, insert_index=1)
                     except Exception as e2:
                         print('[WARN] Slide 2 insertion failed: %s' % e2)
                     # Add Total column + Total row to defects_df for Slide 3
@@ -2731,27 +2886,41 @@ if run_btn:
                     if not labels_df.empty:
                         add_table_parts(prs, policy, labels_df, 'Quality Improvement: Test Case Review Summary', logo)
                     if not qtr_df.empty:
-                        add_table_parts(prs, policy, qtr_df, 'QMetry Test Execution Summary', logo)
+                        add_table_parts(prs, policy, qtr_df, 'QMetry Progression Execution Summary', logo)
+                    # Regression Execution Summary slide
+                    if not reg_qtr_df.empty:
+                        add_table_parts(prs, policy, reg_qtr_df, 'QMetry Regression Execution Summary', logo)
                     # V3.0: Add cycle report slides before Thank You
                     cycle_data = results.get('cycle_reports')
                     if cycle_data:
-                        # Pass execution data for bar chart generation
+                        # Pass both progression and regression execution data for bar charts
                         if not qtr_df.empty:
                             cycle_data['exec_df'] = qtr_df
+                        if not reg_qtr_df.empty:
+                            cycle_data['reg_exec_df'] = reg_qtr_df
                         try:
                             add_cycle_report_slides(prs, policy, cycle_data, logo)
                             print('[OK] Cycle report slides added')
                         except Exception as cre:
                             print('[WARN] Cycle slides failed: %s' % cre)
-                    # V3.0: Features in Scope table
+                    # V3.0: Progression Features in Scope table
                     lbl_path = results.get('label_excel')
                     if lbl_path and lbl_path.exists():
                         try:
                             features_df = pd.read_excel(lbl_path)
-                            add_table_parts_colored(prs, policy, features_df, 'Features in Scope', logo)
-                            print('[OK] Features in Scope slides added')
+                            add_table_parts_colored(prs, policy, features_df, 'Progression: Features in Scope', logo)
+                            print('[OK] Progression Features slides added')
                         except Exception as fe:
-                            print('[WARN] Features slides failed: %s' % fe)
+                            print('[WARN] Progression Features slides failed: %s' % fe)
+                    # V3.0: Regression Features in Scope table
+                    reg_lbl_path = results.get('reg_label_excel')
+                    if reg_lbl_path and reg_lbl_path.exists():
+                        try:
+                            reg_features_df = pd.read_excel(reg_lbl_path)
+                            add_table_parts_colored(prs, policy, reg_features_df, 'Regression: Features in Scope', logo)
+                            print('[OK] Regression Features slides added')
+                        except Exception as fe:
+                            print('[WARN] Regression Features slides failed: %s' % fe)
                     add_thank_you(prs, logo)
                     out_ppt = ARTIFACTS / ('MDA_QA_TMobile_INTG_TOSCA_Weekly_Status_%s.pptx' % datetime.now().strftime('%Y%m%d_%H%M%S'))
                     prs.save(out_ppt)
